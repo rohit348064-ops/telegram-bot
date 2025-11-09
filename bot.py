@@ -2,12 +2,39 @@ import os, sqlite3, uuid
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading, requests, time, os
+
+def web_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running!")
+
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+def keep_alive():
+    url = "https://telegram-bot-rohit348064.repl.co"
+    while True:
+        try:
+            requests.get(url)
+        except:
+            pass
+        time.sleep(240)
+
+web_server()
+threading.Thread(target=keep_alive, daemon=True).start()
 
 TOKEN = (os.environ.get("BOT_TOKEN", "").strip() or (open("token.txt").read().strip() if os.path.exists("token.txt") else ""))
 ADMIN_MASTER = 8303783205
+ADMIN_MASTER = 8303783205
+ADMIN_MASTER = 8303783205
 JOIN_DEFAULTS = [("channel","https://t.me/+DgemL2yHDWVjNTI9","-1002807713488"),("group","https://t.me/+f9txcMDhgRs5ODk1","-1003000982225")]
 REPORT_TARGET_DEFAULT = "-1003154444002"
-PER_REF_DEFAULT = 0.8
+PER_REF_DEFAULT = 5.0
 JOIN_REWARD_DEFAULT = 1.0
 MIN_WITHDRAW_DEFAULT = 10.0
 
