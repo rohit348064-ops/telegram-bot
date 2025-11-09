@@ -1,3 +1,8 @@
-token.txt
+venv/
 __pycache__/
-*.db
+*.pyc
+*.pyo
+token.txt
+.vscode/
+.DS_Store
+*.log

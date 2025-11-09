@@ -1,14 +1,13 @@
-import os, sqlite3, time, asyncio
+import os, sqlite3, uuid
 from datetime import datetime, timezone
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-TOKEN = (os.environ.get("BOT_TOKEN","").strip() or (open("token.txt").read().strip() if os.path.exists("token.txt") else ""))
-
+TOKEN = (os.environ.get("BOT_TOKEN", "").strip() or (open("token.txt").read().strip() if os.path.exists("token.txt") else ""))
 ADMIN_MASTER = 8303783205
 JOIN_DEFAULTS = [("channel","https://t.me/+DgemL2yHDWVjNTI9","-1002807713488"),("group","https://t.me/+f9txcMDhgRs5ODk1","-1003000982225")]
 REPORT_TARGET_DEFAULT = "-1003154444002"
-PER_REF_DEFAULT = 1.0
+PER_REF_DEFAULT = 0.8
 JOIN_REWARD_DEFAULT = 1.0
 MIN_WITHDRAW_DEFAULT = 10.0
 
@@ -19,11 +18,11 @@ cur.execute("CREATE TABLE IF NOT EXISTS refs(referrer INTEGER, refereed INTEGER,
 cur.execute("CREATE TABLE IF NOT EXISTS withdraws(id TEXT PRIMARY KEY, user_id INTEGER, amount REAL, method TEXT, data TEXT, photo TEXT, status TEXT, requested_at TEXT, processed_by INTEGER, processed_at TEXT)")
 cur.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
 cur.execute("CREATE TABLE IF NOT EXISTS channels(kind TEXT, join_link TEXT, check_id TEXT, PRIMARY KEY(kind,check_id))")
+cur.execute("CREATE TABLE IF NOT EXISTS promotions(id TEXT PRIMARY KEY, user_id INTEGER, channel_link TEXT, check_id TEXT, proof_photo TEXT, status TEXT, created_at TEXT, processed_by INTEGER, processed_at TEXT)")
 conn.commit()
 
 def sget(k, default=""):
     c = conn.cursor(); c.execute("SELECT v FROM settings WHERE k=?", (k,)); r = c.fetchone(); return r[0] if r else default
-
 def sset(k, v):
     c = conn.cursor(); c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)",(k,str(v))); conn.commit()
 
@@ -33,12 +32,12 @@ def boot_defaults():
     if not sget("per_ref"): sset("per_ref", PER_REF_DEFAULT)
     if not sget("join_reward"): sset("join_reward", JOIN_REWARD_DEFAULT)
     if not sget("min_withdraw"): sset("min_withdraw", MIN_WITHDRAW_DEFAULT)
+    if not sget("rules_text"): sset("rules_text","")
     c = conn.cursor(); c.execute("SELECT COUNT(*) FROM channels"); n = c.fetchone()[0]
     if n == 0:
         for kind,link,cid in JOIN_DEFAULTS:
             c.execute("INSERT OR IGNORE INTO channels(kind,join_link,check_id) VALUES(?,?,?)",(kind,link,cid))
         conn.commit()
-
 boot_defaults()
 
 def is_admin(uid):
@@ -60,8 +59,7 @@ def rm_admin(uid):
     sset("admins", ",".join(sorted(ids)))
 
 def ensure_user(u):
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM users WHERE user_id=?", (u.id,))
+    c = conn.cursor(); c.execute("SELECT 1 FROM users WHERE user_id=?", (u.id,))
     if not c.fetchone():
         c.execute("INSERT INTO users(user_id,username,created_at) VALUES(?,?,?)",(u.id, u.username or u.first_name or "", datetime.now(timezone.utc).isoformat()))
         conn.commit()
@@ -72,13 +70,10 @@ def user_row(uid):
 
 def set_balance(uid, amt):
     c = conn.cursor(); c.execute("UPDATE users SET balance=? WHERE user_id=?", (float(amt), uid)); conn.commit()
-
 def add_balance(uid, amt):
     c = conn.cursor(); c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (float(amt), uid)); conn.commit()
-
 def mark_verified(uid):
     c = conn.cursor(); c.execute("UPDATE users SET verified=1, reward_claimed=1 WHERE user_id=?", (uid,)); conn.commit()
-
 def unverify(uid):
     c = conn.cursor(); c.execute("UPDATE users SET verified=0 WHERE user_id=?", (uid,)); conn.commit()
 
@@ -96,15 +91,16 @@ async def joined_everywhere(bot, uid):
     ok = True
     for _,_,check_id in channel_rows():
         m = await safe_get_member(bot, check_id, uid)
-        ok = ok and bool(m and str(m.status) not in ("left","kicked"))
+        status = str(getattr(m, "status", "left")) if m else "left"
+        ok = ok and (status not in ("left","kicked"))
     return ok
 
 def main_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 Balance", callback_data="u_bal"), InlineKeyboardButton("👥 Referral", callback_data="u_ref")],
         [InlineKeyboardButton("🏦 Withdraw", callback_data="u_wd"), InlineKeyboardButton("✅ Verify", callback_data="u_verify")],
-        [InlineKeyboardButton("📜 Rules", callback_data="u_rules"), InlineKeyboardButton("🔄 Refresh", callback_data="u_refresh")],
-        [InlineKeyboardButton("⚙️ Admin", callback_data="a_panel")]
+        [InlineKeyboardButton("📢 Promote Channel", callback_data="u_promote"), InlineKeyboardButton("📜 Rules", callback_data="u_rules")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="u_refresh"), InlineKeyboardButton("⚙️ Admin", callback_data="a_panel")],
     ])
 
 def verify_kb():
@@ -120,9 +116,11 @@ def admin_kb():
         [InlineKeyboardButton("🔗 Manage Join", callback_data="a_manage_join")],
         [InlineKeyboardButton("💳 Rewards / MinWD", callback_data="a_rewards")],
         [InlineKeyboardButton("📣 Withdraw Report", callback_data="a_report")],
+        [InlineKeyboardButton("📝 Rules Text", callback_data="a_rules")],
         [InlineKeyboardButton("👤 Admins", callback_data="a_admins")],
         [InlineKeyboardButton("📊 Users", callback_data="a_users"), InlineKeyboardButton("💸 Requests", callback_data="a_wq")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="a_bc")],
+        [InlineKeyboardButton("📯 Promotions", callback_data="a_promos")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
     ])
 
@@ -143,6 +141,12 @@ def admin_rewards_kb():
 def admin_admins_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Admin", callback_data="aa_add"), InlineKeyboardButton("➖ Remove Admin", callback_data="aa_rm")],
+        [InlineKeyboardButton("🔙 Back", callback_data="a_panel")]
+    ])
+
+def admin_promos_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Pending", callback_data="p_list")],
         [InlineKeyboardButton("🔙 Back", callback_data="a_panel")]
     ])
 
@@ -182,8 +186,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except: pass
             except: pass
     ok = await try_auto_verify(context.bot, u.id, context.user_data)
-    if ok: await update.message.reply_text("🎉 Verified", reply_markup=main_kb())
-    else: await update.message.reply_text(f"👋 Welcome {u.first_name}\nJoin and verify.", reply_markup=verify_kb())
+    if ok: await update.message.reply_text("Verified", reply_markup=main_kb())
+    else: await update.message.reply_text("Welcome\nJoin and verify.", reply_markup=verify_kb())
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
@@ -192,71 +196,77 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = q.from_user.id; ensure_user(q.from_user)
-    data = q.data
-    if data=="u_bal":
+    d = q.data
+    if d=="u_bal":
         u = user_row(uid); b = u["balance"] if u else 0.0
-        await q.message.reply_text(f"💰 Balance: ₹{b:.2f}", reply_markup=main_kb()); return
-    if data=="u_ref":
+        await q.message.reply_text(f"Balance: ₹{b:.2f}", reply_markup=main_kb()); return
+    if d=="u_ref":
         me = await context.bot.get_me(); link = f"https://t.me/{me.username}?start={uid}"
-        await q.message.reply_text(f"👥 Referral Link:\n{link}\nPer referral ₹{sget('per_ref',PER_REF_DEFAULT)}", reply_markup=main_kb()); return
-    if data=="u_rules":
-        await q.message.reply_text("Join all required. One user one account. Withdraw after admin approval.", reply_markup=main_kb()); return
-    if data=="u_refresh":
+        await q.message.reply_text(f"Referral Link:\n{link}\nPer referral ₹{sget('per_ref',PER_REF_DEFAULT)}", reply_markup=main_kb()); return
+    if d=="u_rules":
+        await q.message.reply_text(sget("rules_text",""), reply_markup=main_kb()); return
+    if d=="u_refresh":
         await try_auto_verify(context.bot, uid, context.user_data)
         await q.message.reply_text("Refreshed.", reply_markup=main_kb()); return
-    if data=="u_verify":
+    if d=="u_verify":
         ok = await try_auto_verify(context.bot, uid, context.user_data)
-        if ok: await q.message.reply_text("✅ Verified now.", reply_markup=main_kb()); return
-        await q.message.reply_text("Join required and press again.", reply_markup=verify_kb()); return
-    if data=="u_wd":
+        if ok: await q.message.reply_text("Verified now.", reply_markup=main_kb()); return
+        await q.message.reply_text("Join required, then press again.", reply_markup=verify_kb()); return
+    if d=="u_wd":
         context.user_data["await_wd_amount"]=True
         await q.message.reply_text(f"Enter amount (min ₹{sget('min_withdraw',MIN_WITHDRAW_DEFAULT)})"); return
-    if data=="a_panel":
+    if d=="u_promote":
+        context.user_data["prom_wait_link"]=True
+        await q.message.reply_text("Send your channel invite link."); return
+    if d=="a_panel":
         if not is_admin(uid): await q.answer("Admin only", show_alert=True); return
         await q.message.reply_text("Admin", reply_markup=admin_kb()); return
-    if data=="a_manage_join":
+    if d=="a_manage_join":
         if not is_admin(uid): return
         await q.message.reply_text("Manage Join", reply_markup=admin_join_kb()); return
-    if data=="aj_list":
+    if d=="aj_list":
         if not is_admin(uid): return
         rows=channel_rows(); txt="No channels." if not rows else "\n".join([f"{k} | {cid} | {lnk}" for k,lnk,cid in rows])
         await q.message.reply_text(txt, reply_markup=admin_join_kb()); return
-    if data=="aj_add_ch":
+    if d=="aj_add_ch":
         if not is_admin(uid): return
         context.user_data["await_add_kind"]="channel"; context.user_data["await_add_link"]=True
         await q.message.reply_text("Send channel invite link."); return
-    if data=="aj_add_gp":
+    if d=="aj_add_gp":
         if not is_admin(uid): return
         context.user_data["await_add_kind"]="group"; context.user_data["await_add_link"]=True
         await q.message.reply_text("Send group invite link."); return
-    if data=="aj_del":
+    if d=="aj_del":
         if not is_admin(uid): return
         context.user_data["await_del_check"]=True
-        await q.message.reply_text("Send check ID or @username to remove."); return
-    if data=="a_rewards":
+        await q.message.reply_text("Send check ID (@username or -100..)."); return
+    if d=="a_rewards":
         if not is_admin(uid): return
         await q.message.reply_text("Rewards / MinWD", reply_markup=admin_rewards_kb()); return
-    if data=="ar_set_join":
+    if d=="ar_set_join":
         context.user_data["await_set_join"]=True; await q.message.reply_text("Send join reward ₹"); return
-    if data=="ar_set_ref":
+    if d=="ar_set_ref":
         context.user_data["await_set_ref"]=True; await q.message.reply_text("Send per referral ₹"); return
-    if data=="ar_set_minwd":
+    if d=="ar_set_minwd":
         context.user_data["await_set_minwd"]=True; await q.message.reply_text("Send minimum withdraw ₹"); return
-    if data=="a_report":
+    if d=="a_report":
         if not is_admin(uid): return
-        context.user_data["await_report"]=True; await q.message.reply_text("Send withdraw report chat id (@username or -100..)"); return
-    if data=="a_admins":
+        context.user_data["await_report"]=True; await q.message.reply_text("Send report chat id (@username or -100..)"); return
+    if d=="a_rules":
+        if not is_admin(uid): return
+        context.user_data["await_rules"]=True; await q.message.reply_text("Send new rules text"); return
+    if d=="a_admins":
         if not is_admin(uid): return
         await q.message.reply_text(f"Admins: {sget('admins')}", reply_markup=admin_admins_kb()); return
-    if data=="aa_add":
+    if d=="aa_add":
         context.user_data["await_add_admin"]=True; await q.message.reply_text("Send user ID"); return
-    if data=="aa_rm":
+    if d=="aa_rm":
         context.user_data["await_rm_admin"]=True; await q.message.reply_text("Send user ID to remove"); return
-    if data=="a_users":
+    if d=="a_users":
         if not is_admin(uid): return
         c = conn.cursor(); c.execute("SELECT COUNT(*), SUM(balance) FROM users"); n,tot=c.fetchone(); tot=tot or 0.0
         await q.message.reply_text(f"Users: {n}\nTotal balance: ₹{tot:.2f}", reply_markup=admin_kb()); return
-    if data=="a_wq":
+    if d=="a_wq":
         if not is_admin(uid): return
         c=conn.cursor(); c.execute("SELECT id,user_id,amount,method,data,photo,status,requested_at FROM withdraws WHERE status='pending' ORDER BY requested_at DESC")
         rows=c.fetchall()
@@ -264,39 +274,74 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for wid,uidr,amt,mth,dta,ph,_,at in rows:
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"w_ok_{wid}")],[InlineKeyboardButton("❌ Reject",callback_data=f"w_no_{wid}")]])
             cap=f"{wid}\nUser:{uidr}\nAmt:₹{amt}\nMethod:{mth}\nData:{dta}\nAt:{at}"
-            if ph: 
+            if ph:
                 try: await q.message.reply_photo(ph, caption=cap, reply_markup=kb)
                 except: await q.message.reply_text(cap, reply_markup=kb)
             else:
                 await q.message.reply_text(cap, reply_markup=kb)
         return
-    if data=="a_bc":
+    if d=="a_bc":
         if not is_admin(uid): return
         context.user_data["await_broadcast"]=True; await q.message.reply_text("Send broadcast text"); return
-    if data.startswith("w_ok_") or data.startswith("w_no_"):
+    if d=="a_promos":
         if not is_admin(uid): return
-        wid=data.split("_",2)[2]; c=conn.cursor(); c.execute("SELECT user_id,amount,method,data,photo,status FROM withdraws WHERE id=?",(wid,)); r=c.fetchone()
+        await q.message.reply_text("Promotions", reply_markup=admin_promos_kb()); return
+    if d=="p_list":
+        if not is_admin(uid): return
+        c=conn.cursor(); c.execute("SELECT id,user_id,channel_link,check_id,proof_photo,status,created_at FROM promotions WHERE status='pending' ORDER BY created_at DESC")
+        rows=c.fetchall()
+        if not rows: await q.message.reply_text("No pending promotions.", reply_markup=admin_kb()); return
+        for pid,uidr,cl,chk,ph,st,at in rows:
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"p_ok_{pid}")],[InlineKeyboardButton("❌ Reject",callback_data=f"p_no_{pid}")]])
+            cap=f"{pid}\nUser:{uidr}\nLink:{cl}\nCheck:{chk}\nAt:{at}"
+            if ph:
+                try: await q.message.reply_photo(ph, caption=cap, reply_markup=kb)
+                except: await q.message.reply_text(cap, reply_markup=kb)
+            else:
+                await q.message.reply_text(cap, reply_markup=kb)
+        return
+    if d.startswith("p_ok_") or d.startswith("p_no_"):
+        if not is_admin(uid): return
+        pid=d.split("_",2)[2]; c=conn.cursor(); c.execute("SELECT user_id,channel_link,check_id,status FROM promotions WHERE id=?", (pid,)); r=c.fetchone()
+        if not r: await q.message.reply_text("Not found.", reply_markup=admin_kb()); return
+        uidr,cl,chk,st=r
+        if st!="pending": await q.message.reply_text("Already processed.", reply_markup=admin_kb()); return
+        if d.startswith("p_ok_"):
+            c.execute("UPDATE promotions SET status='approved', processed_by=?, processed_at=? WHERE id=?", (uid, datetime.now(timezone.utc).isoformat(), pid))
+            c.execute("INSERT OR IGNORE INTO channels(kind,join_link,check_id) VALUES(?,?,?)", ("channel", cl, chk)); conn.commit()
+            try: await context.bot.send_message(uidr, "Your channel added for promotion.")
+            except: pass
+            await q.message.reply_text("Promotion approved", reply_markup=admin_kb())
+        else:
+            c.execute("UPDATE promotions SET status='rejected', processed_by=?, processed_at=? WHERE id=?", (uid, datetime.now(timezone.utc).isoformat(), pid)); conn.commit()
+            try: await context.bot.send_message(uidr, "Promotion rejected.")
+            except: pass
+            await q.message.reply_text("Promotion rejected", reply_markup=admin_kb())
+        return
+    if d.startswith("w_ok_") or d.startswith("w_no_"):
+        if not is_admin(uid): return
+        wid=d.split("_",2)[2]; c=conn.cursor(); c.execute("SELECT user_id,amount,method,data,photo,status FROM withdraws WHERE id=?",(wid,)); r=c.fetchone()
         if not r: await q.message.reply_text("Not found.", reply_markup=admin_kb()); return
         uidr,amt,method,dta,ph,status=r
         if status!="pending": await q.message.reply_text("Already processed.", reply_markup=admin_kb()); return
-        if data.startswith("w_ok_"):
+        if d.startswith("w_ok_"):
             set_balance(uidr,0.0)
             c.execute("UPDATE withdraws SET status='approved', processed_by=?, processed_at=? WHERE id=?", (uid, datetime.now(timezone.utc).isoformat(), wid)); conn.commit()
-            try: await context.bot.send_message(uidr, f"✅ Payment Successful ₹{amt}")
+            try: await context.bot.send_message(uidr, f"Payment Successful ₹{amt}")
             except: pass
             try:
                 tgt=sget("report_target",REPORT_TARGET_DEFAULT)
-                if ph: await context.bot.send_photo(tgt, ph, caption=f"✅ Paid\nUser:{uidr}\nAmt:₹{amt}\nMethod:{method}\nData:{dta}\nID:{wid}")
-                else: await context.bot.send_message(tgt, f"✅ Paid\nUser:{uidr}\nAmt:₹{amt}\nMethod:{method}\nData:{dta}\nID:{wid}")
+                if ph: await context.bot.send_photo(tgt, ph, caption=f"Paid\nUser:{uidr}\nAmt:₹{amt}\nMethod:{method}\nData:{dta}\nID:{wid}")
+                else: await context.bot.send_message(tgt, f"Paid\nUser:{uidr}\nAmt:₹{amt}\nMethod:{method}\nData:{dta}\nID:{wid}")
             except: pass
-            await q.message.reply_text("Approved")
+            await q.message.reply_text("Approved", reply_markup=admin_kb())
         else:
             c.execute("UPDATE withdraws SET status='rejected', processed_by=?, processed_at=? WHERE id=?", (uid, datetime.now(timezone.utc).isoformat(), wid)); conn.commit()
-            try: await context.bot.send_message(uidr, f"❌ Payment Rejected ₹{amt}")
+            try: await context.bot.send_message(uidr, f"Payment Rejected ₹{amt}")
             except: pass
-            await q.message.reply_text("Rejected")
+            await q.message.reply_text("Rejected", reply_markup=admin_kb())
         return
-    if data=="back_main":
+    if d=="back_main":
         await q.message.reply_text("Back", reply_markup=main_kb()); return
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,13 +352,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amt=float(t); minv=float(sget("min_withdraw",MIN_WITHDRAW_DEFAULT))
             u=user_row(uid); bal=u["balance"] if u else 0.0
-            if amt<minv: await update.message.reply_text(f"Min ₹{minv}"); return
-            if amt>bal: await update.message.reply_text("Insufficient balance"); return
+            if amt<minv: await update.message.reply_text(f"Min ₹{minv}", reply_markup=main_kb()); return
+            if amt>bal: await update.message.reply_text("Insufficient balance", reply_markup=main_kb()); return
             context.user_data["wd_amount"]=amt
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("Send UPI ID",callback_data="wd_m_upi"),InlineKeyboardButton("Send QR Photo",callback_data="wd_m_qr")]])
             await update.message.reply_text("Choose method", reply_markup=kb); return
         except:
-            await update.message.reply_text("Send a number amount"); return
+            await update.message.reply_text("Send a number amount", reply_markup=main_kb()); return
     if context.user_data.get("await_report") and is_admin(uid):
         context.user_data.pop("await_report",None); sset("report_target", t)
         await update.message.reply_text("Saved.", reply_markup=admin_kb()); return
@@ -353,57 +398,70 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Removed.", reply_markup=admin_join_kb()); return
     if context.user_data.get("await_broadcast") and is_admin(uid):
         context.user_data.pop("await_broadcast",None)
-        c=conn.cursor(); c.execute("SELECT user_id FROM users"); rows=c.fetchall(); sent=0
-        for (u,) in rows:
-            try: await context.bot.send_message(u, t); sent+=1
+        c=conn.cursor(); c.execute("SELECT user_id FROM users"); ids=[r[0] for r in c.fetchall()]
+        ok=0
+        for i in ids:
+            try:
+                await context.bot.send_message(i, t); ok+=1
             except: pass
-        await update.message.reply_text(f"Broadcast sent to {sent}.", reply_markup=admin_kb()); return
+        await update.message.reply_text(f"Sent: {ok}", reply_markup=admin_kb()); return
+    if context.user_data.get("await_rules") and is_admin(uid):
+        context.user_data.pop("await_rules",None); sset("rules_text", t)
+        await update.message.reply_text("Rules updated.", reply_markup=admin_kb()); return
+    if context.user_data.get("prom_wait_link"):
+        context.user_data.pop("prom_wait_link",None); context.user_data["prom_link"]=t; context.user_data["prom_wait_check"]=True
+        await update.message.reply_text("Send channel check ID (@username or -100..)"); return
+    if context.user_data.get("prom_wait_check"):
+        context.user_data.pop("prom_wait_check",None); context.user_data["prom_check"]=t; context.user_data["prom_wait_proof"]=True
+        await update.message.reply_text("Send payment proof photo"); return
+    if context.user_data.get("await_add_admin") or context.user_data.get("await_rm_admin"): return
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; ensure_user(update.effective_user)
-    if context.user_data.get("await_wd_qr"):
-        context.user_data.pop("await_wd_qr",None)
-        ph = update.message.photo[-1].file_id if update.message.photo else None
-        amt=context.user_data.pop("wd_amount",0.0)
-        wid="w"+str(int(time.time()*1000))
-        c=conn.cursor(); c.execute("INSERT INTO withdraws(id,user_id,amount,method,data,photo,status,requested_at) VALUES(?,?,?,?,?,?,?,?)",(wid,uid,float(amt),"QR","",ph,"pending",datetime.now(timezone.utc).isoformat())); conn.commit()
-        try: await context.bot.send_message(sget("report_target",REPORT_TARGET_DEFAULT), f"💸 Withdraw Request\nID:{wid}\nUser:{uid}\nAmt:₹{amt}\nMethod:QR")
-        except: pass
-        await update.message.reply_text(f"Requested ₹{amt}. ID: {wid}"); return
-
-async def on_cb_wd_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); uid=q.from_user.id
-    if q.data=="wd_m_upi":
-        context.user_data["await_wd_upi"]=True
-        await q.message.reply_text("Enter UPI ID"); return
-    if q.data=="wd_m_qr":
-        context.user_data["await_wd_qr"]=True
-        await q.message.reply_text("Send QR photo"); return
-
-async def on_text_wd_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid=update.effective_user.id; ensure_user(update.effective_user)
-    if context.user_data.get("await_wd_upi"):
-        context.user_data.pop("await_wd_upi",None)
-        upi=(update.message.text or "").strip()
-        amt=context.user_data.pop("wd_amount",0.0)
-        wid="w"+str(int(time.time()*1000))
-        c=conn.cursor(); c.execute("INSERT INTO withdraws(id,user_id,amount,method,data,photo,status,requested_at) VALUES(?,?,?,?,?,?,?,?)",(wid,uid,float(amt),"UPI",upi,"","pending",datetime.now(timezone.utc).isoformat())); conn.commit()
-        try: await context.bot.send_message(sget("report_target",REPORT_TARGET_DEFAULT), f"💸 Withdraw Request\nID:{wid}\nUser:{uid}\nAmt:₹{amt}\nMethod:UPI\nData:{upi}")
-        except: pass
-        await update.message.reply_text(f"Requested ₹{amt}. ID: {wid}")
+    ph = update.message.photo[-1].file_id if update.message.photo else None
+    if context.user_data.get("prom_wait_proof"):
+        context.user_data.pop("prom_wait_proof",None)
+        link=context.user_data.pop("prom_link",""); chk=context.user_data.pop("prom_check","")
+        pid=str(uuid.uuid4())
+        c=conn.cursor(); c.execute("INSERT OR REPLACE INTO promotions(id,user_id,channel_link,check_id,proof_photo,status,created_at) VALUES(?,?,?,?,?,?,?)",(pid,uid,link,chk,ph,"pending",datetime.now(timezone.utc).isoformat())); conn.commit()
+        await update.message.reply_text("Promotion request submitted. Wait for approval.", reply_markup=main_kb()); return
+    if context.user_data.get("wd_wait_qr"):
+        context.user_data.pop("wd_wait_qr",None)
+        amt=context.user_data.pop("wd_amount",0)
+        wid=str(uuid.uuid4()); c=conn.cursor()
+        c.execute("INSERT OR REPLACE INTO withdraws(id,user_id,amount,method,data,photo,status,requested_at) VALUES(?,?,?,?,?,?,?,?)",(wid,uid,amt,"qr","",ph,"pending",datetime.now(timezone.utc).isoformat())); conn.commit()
+        await update.message.reply_text("Withdraw request submitted.", reply_markup=main_kb()); return
 
-def app_build():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler(["start"], cmd_start))
-    app.add_handler(CommandHandler(["menu"], cmd_menu))
-    app.add_handler(CallbackQueryHandler(on_cb, pattern="^(u_|a_|aj_|ar_|aa_|w_ok_|w_no_|back_main)"))
-    app.add_handler(CallbackQueryHandler(on_cb_wd_method, pattern="^(wd_m_upi|wd_m_qr)$"))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_wd_upi))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    return app
+async def on_cb2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; d=q.data; uid=q.from_user.id
+    if d=="wd_m_upi":
+        context.user_data["wd_wait_upi"]=True
+        await q.message.reply_text("Send your UPI ID"); return
+    if d=="wd_m_qr":
+        context.user_data["wd_wait_qr"]=True
+        await q.message.reply_text("Send QR screenshot/photo"); return
 
-if __name__ == "__main__":
-    if not TOKEN: raise SystemExit("BOT_TOKEN missing")
-    app = app_build()
-    app.run_polling(close_loop=False)
+async def on_text2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid=update.effective_user.id; t=(update.message.text or "").strip()
+    if context.user_data.get("wd_wait_upi"):
+        context.user_data.pop("wd_wait_upi",None)
+        amt=context.user_data.pop("wd_amount",0)
+        wid=str(uuid.uuid4()); c=conn.cursor()
+        c.execute("INSERT OR REPLACE INTO withdraws(id,user_id,amount,method,data,photo,status,requested_at) VALUES(?,?,?,?,?,?,?,?)",(wid,uid,amt,"upi",t,"","pending",datetime.now(timezone.utc).isoformat())); conn.commit()
+        await update.message.reply_text("Withdraw request submitted.", reply_markup=main_kb()); return
+
+async def on_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await on_text(update, context)
+    await on_text2(update, context)
+
+async def on_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await on_cb(update, context)
+    await on_cb2(update, context)
+
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", cmd_start))
+app.add_handler(CommandHandler("menu", cmd_menu))
+app.add_handler(CallbackQueryHandler(on_cb_router))
+app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_router))
+app.run_polling()
